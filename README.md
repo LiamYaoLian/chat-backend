@@ -53,16 +53,19 @@ GET `/v1/chats/{chat_id}/messages?cursor=<opaque>&limit=50`
 
 req header: `Authorization: Bearer <token>`
 
-res body: `{ "messages": [{ "message_id": "uuid", "chat_id": "uuid", "sender_id": "uid", "content": "text", "attachments": [], "created_at": "iso8601" }], "next_cursor": "opaque|null" }`
+res body: `{ "messages": [{ "message_id": "uuid", "chat_id": "uuid", "sender_id": "uid", "content": "text", "attachments": [{ "attachment_id": "uuid", "content_type": "string", "byte_size": 0, "url": "https://..." }], "created_at": "iso8601" }], "next_cursor": "opaque|null" }` (server only returns messages within the retention window, e.g. last 30 days)
 
-### 5. Create Attachment (upload binary)
+### 5. Create Attachment (register upload)
+
+**5a. Small uploads (multipart, server stores or forwards the object)**
+
 POST `/v1/attachments`
 
 req header: `Authorization: Bearer <token>`, `Content-Type: multipart/form-data`
 
 req body: multipart field `file` (and optional `content_type`)
 
-res body: `{ "attachment_id": "uuid", "url": "https://...", "byte_size": 0, "content_type": "string" }`
+req body: `{}` (or `{ "etag": "string" }` if the store returns one)
 
 TODO Liam: presigned link
 
@@ -74,15 +77,15 @@ Client → server frames are JSON with a `type` and `payload` (shape below uses 
 
 * `-> CREATE_CHAT`: `{ "name": "string", "participants": ["uid1", "uid2"] }`
 * `-> MODIFY_CHAT_PARTICIPANTS`: `{ "chat_id": "uuid", "add": ["uid"], "remove": ["uid"] }`
-* `-> SEND_MSG`: `{ "chat_id": "uuid", "client_message_id", "content": "text", "attachments": [], "created_at": "iso8601" }` (`client_message_id` for idempotency)
+* `-> SEND_MSG`: `{ "chat_id": "uuid", "content": "text", "attachments": [{ "attachment_id": "uuid" }], "client_message_id": "uuid", "client_created_at": "iso8601" }` (`client_message_id` required for idempotency; `client_created_at` optional display hint — **authoritative time is server `created_at` on `<- NEW_MSG`**)
 * `-> CREATE_ATTACHMENT`: `{ "filename": "string", "content_type": "string", "byte_size": 0 }` — server responds with upload instructions (e.g. presigned URL) TODO Liam: REST?
 
 Server → client:
 
-* `<- NEW_MSG`: `{ "message_id": "uuid", "chat_id": "uuid", "sender_id": "uid", "content": "text", "attachments": [], "created_at": "iso8601" }`
-* `<- CHAT_UPDATE`: `{ "chat_id": "uuid", "type": "participants_changed|metadata_changed", "participants": ["uid"], "name": "string|null", "updated_at": "iso8601" }`
+* `<- NEW_MSG`: `{ "message_id": "uuid", "chat_id": "uuid", "sender_id": "uid", "content": "text", "attachments": [{ "attachment_id": "uuid", "content_type": "string", "byte_size": 0, "url": "https://..." }], "created_at": "iso8601" }`
+* `<- CHAT_UPDATE`: `{ "chat_id": "uuid", "change": "participants|metadata", "participants": ["uid"], "name": "string|null", "updated_at": "iso8601" }`
 
-Ack / error pattern: for each `->` command, reply with `<- ACK` or `<- ERROR` carrying `client_message_id` or a server `request_id` so clients can correlate.
+Ack / error pattern: for each `->` command, reply with `<- ACK` or `<- ERROR` whose payload includes `request_id` (if sent) and/or `client_message_id`, plus `error_code` / `message` on errors.
 
 ## High Level Design
 
