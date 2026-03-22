@@ -89,10 +89,23 @@ Ack / error pattern: for each `->` command, reply with `<- ACK` or `<- ERROR` wh
 
 ## High Level Design
 
-1. start group chats with multiple participants (limit 100): TODO
-2. send/receive messages: TODO
-3. receive messages sent while they are not online (up to 30 days): TODO
-4. send/receive media in their messages: TODO
+**Services (logical):** **API service** (REST behind API Gateway or ALB), **Realtime service** (WebSocket, often separate ASG/Lambda + API Gateway WebSocket), **Attachment service** (can share the API service process). Shared **auth** validates JWT at the edge; business logic enforces “is participant.”
+
+**Data:** **Amazon DynamoDB** for `Chat` (PK `chat_id`), `UserChat` (PK `user_id`, SK `chat_id`) for `GET /v1/chats`, and `Message` (PK `chat_id`, SK `created_at#message_id`) for history and retention scans. **Why DynamoDB:** single-digit-ms reads at scale, multi-AZ HA, TTL on `Message` for automatic ~30-day expiry (fits NFR 1/3/5). **Trade-off:** you must model access patterns up front (GSIs for rare queries cost more); no rich ad-hoc SQL.
+
+**Blobs:** **Amazon S3** for bytes; **POST /v1/attachments** (or presigned session) stores metadata in DynamoDB (`Attachment` keyed by `attachment_id`, owner, size, S3 key). **Why S3:** cheap durable object storage; API servers stay stateless. **Trade-off:** extra hops vs uploading straight to DB (not viable for media scale).
+
+**Realtime fan-out:** **`wss://…/v1/ws`** → **Realtime**; **`SEND_MSG`** conditional-writes **Message** in **DynamoDB** (idempotent on `client_message_id`), then publishes **NewMessage**. **Option A — SNS → SQS:** durable if a worker dies (NFR 2); **trade-off:** extra latency vs memory. **Option B — Redis (ElastiCache) Pub/Sub:** fastest fan-out to connection servers (NFR 4); **trade-off:** ephemeral—rely on DynamoDB as truth and optional SQS for backlog. **Kafka / Kinesis:** per-`chat_id` ordering and replay; **trade-off:** more ops than SQS.
+
+**Flows (client → service → storage):**
+
+1. **Group chat (≤100 participants):** `POST /v1/chats` → **API** validates body, writes `Chat` + transactional `UserChat` rows for each member in **DynamoDB**, returns `chat_id`. `PATCH …/participants` updates `Chat` membership and `UserChat` adds/deletes; emits `<- CHAT_UPDATE` via the same bus as below.
+
+2. **Send/receive (online):** `SEND_MSG` on **Realtime** → write **Message** to **DynamoDB** → publish **NewMessage** event → **Realtime** workers consume and push `<- NEW_MSG` only to sockets whose `user_id` is in that chat (membership read from DynamoDB cache or `UserChat`).
+
+3. **Offline / catch-up:** `GET /v1/chats/{id}/messages` → **API** queries **DynamoDB** `Message` by `chat_id` (cursor on SK), returns only rows whose TTL has not expired (retention policy).
+
+4. **Media:** `POST /v1/attachments` (multipart or presigned) → **API** writes object to **S3**, row to **DynamoDB**; `SEND_MSG` references `attachment_id`; `<- NEW_MSG` includes signed **S3** URL or CDN URL.
 
 ## Deep Dive
 
